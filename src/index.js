@@ -1,14 +1,16 @@
 /**
  * LES NOIRES - Messagerie Africaine Décentralisée
- * 
+ *
  * Application principale
  */
 
 require('dotenv').config();
 const express = require('express');
+const http = require('http');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const { Server } = require('socket.io');
 
 // Importations locales
 const PhoneValidator = require('./auth/phoneValidator');
@@ -16,11 +18,19 @@ const Ed25519Crypto = require('./crypto/ed25519');
 const MeshNode = require('./mesh/meshNode');
 
 // Configuration
-const PORT = process.env.PORT || 3000;
+const API_PORT = Number(process.env.PORT || process.env.API_PORT || 8080);
+const MESH_PORT = Number(process.env.MESH_PORT || 9090);
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // Initialiser Express
 const app = express();
+const apiServer = http.createServer(app);
+const meshServer = new Server(apiServer, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
+});
 
 // Middlewares de sécurité
 app.use(helmet());
@@ -34,6 +44,83 @@ app.use(express.urlencoded({ extended: true }));
 // Store utilisateurs et nœuds (en mémoire pour démo)
 const users = new Map();
 const meshNodes = new Map();
+const meshPeers = new Map();
+
+function normalizePhone(phone) {
+  const validation = PhoneValidator.validate(phone);
+  if (!validation.valid) return null;
+  return validation.phoneNumber;
+}
+
+// ============================================================================
+// MESH SOCKET SERVER
+// ============================================================================
+meshServer.on('connection', (socket) => {
+  console.log('Mesh client connected:', socket.id);
+
+  socket.on('register-peer', ({ phoneNumber }) => {
+    const normalized = normalizePhone(phoneNumber);
+    if (!normalized) {
+      socket.emit('peer-error', { error: 'Numéro africain invalide' });
+      return;
+    }
+
+    meshPeers.set(normalized, {
+      id: socket.id,
+      phoneNumber: normalized,
+      connectedAt: Date.now(),
+    });
+
+    socket.emit('peer-registered', {
+      phoneNumber: normalized,
+      meshPort: MESH_PORT,
+      online: true,
+    });
+
+    meshServer.emit('peer-online', {
+      phoneNumber: normalized,
+      peerCount: meshPeers.size,
+    });
+  });
+
+  socket.on('mesh-message', ({ from, to, content, signature }) => {
+    const fromPhone = normalizePhone(from);
+    const toPhone = normalizePhone(to);
+
+    if (!fromPhone || !toPhone) {
+      socket.emit('mesh-error', { error: 'Numéro invalide' });
+      return;
+    }
+
+    const targetSocket = [...meshPeers.entries()].find(([phone]) => phone === toPhone)?.[1];
+    const payload = {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      from: fromPhone,
+      to: toPhone,
+      content,
+      signature,
+      timestamp: Date.now(),
+      hops: 1,
+      delivered: !!targetSocket,
+    };
+
+    if (targetSocket) {
+      meshServer.to(targetSocket.id).emit('mesh-message', payload);
+    }
+
+    meshServer.emit('message-relayed', payload);
+  });
+
+  socket.on('disconnect', () => {
+    for (const [phoneNumber, peer] of meshPeers.entries()) {
+      if (peer.id === socket.id) {
+        meshPeers.delete(phoneNumber);
+        meshServer.emit('peer-offline', { phoneNumber });
+        break;
+      }
+    }
+  });
+});
 
 // ============================================================================
 // ROUTES DE SANTÉ
@@ -44,6 +131,8 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     service: 'LES NOIRES',
     version: '0.1.0',
+    apiPort: API_PORT,
+    meshPort: MESH_PORT,
     timestamp: new Date().toISOString(),
   });
 });
@@ -61,7 +150,7 @@ app.post('/api/auth/register', (req, res) => {
 
   // Valider le numéro africain
   const validation = PhoneValidator.validate(phoneNumber);
-  
+
   if (!validation.valid) {
     return res.status(400).json({
       error: validation.error,
@@ -98,7 +187,7 @@ app.post('/api/auth/register', (req, res) => {
     maxPeers: 50,
     discoveryInterval: 30000,
   });
-  
+
   meshNodes.set(validation.phoneNumber, meshNode);
 
   res.status(201).json({
@@ -108,6 +197,8 @@ app.post('/api/auth/register', (req, res) => {
       phoneNumber: user.phoneNumber,
       country: user.country,
       publicKey: user.publicKey,
+      apiPort: API_PORT,
+      meshPort: MESH_PORT,
     },
   });
 });
@@ -120,7 +211,7 @@ app.post('/api/auth/verify', (req, res) => {
   const { phoneNumber } = req.body;
 
   const validation = PhoneValidator.validate(phoneNumber);
-  
+
   if (!validation.valid) {
     return res.status(400).json({
       error: validation.error,
@@ -167,7 +258,7 @@ app.post('/api/messages/send', (req, res) => {
 
   // Chiffrer le message
   const encrypted = Ed25519Crypto.encryptMessage(message, fromUser.symmetricKey);
-  
+
   // Signer le message
   const messageStr = JSON.stringify(encrypted);
   const signature = Ed25519Crypto.signMessage(messageStr, fromUser.secretKey);
@@ -179,10 +270,20 @@ app.post('/api/messages/send', (req, res) => {
   }
 
   // Envoyer via le réseau mesh
-  const messageId = meshNode.sendMessage({
+  const messageId = meshNode ? meshNode.sendMessage({
     to: toValidation.phoneNumber,
     content: messageStr,
     signature,
+  }) : `local-${Date.now()}`;
+
+  meshServer.emit('mesh-message', {
+    id: messageId,
+    from: fromValidation.phoneNumber,
+    to: toValidation.phoneNumber,
+    content: messageStr,
+    signature,
+    timestamp: Date.now(),
+    delivered: true,
   });
 
   res.json({
@@ -266,6 +367,7 @@ app.post('/api/mesh/start', (req, res) => {
     message: 'Nœud démarré',
     nodeId: meshNode.nodeId,
     phoneNumber: validation.phoneNumber,
+    meshPort: MESH_PORT,
   });
 });
 
@@ -352,7 +454,7 @@ app.use((req, res) => {
 
 app.use((err, req, res, next) => {
   console.error('Erreur:', err);
-  
+
   res.status(500).json({
     error: 'Erreur serveur',
     message: NODE_ENV === 'development' ? err.message : 'Une erreur est survenue',
@@ -360,22 +462,24 @@ app.use((err, req, res, next) => {
 });
 
 // ============================================================================
-// DÉMARRAGE DU SERVEUR
+// DÉMARRAGE DES SERVEURS
 // ============================================================================
 
-app.listen(PORT, () => {
+apiServer.listen(API_PORT, () => {
   console.log(`
 ╔════════════════════════════════════════════════════════╗
 ║                  LES NOIRES                            ║
-║           Messagerie Africaine Décentralisée           ║
+║     Messagerie Africaine Décentralisée                ║
 ║                                                        ║
-║  La messagerie qui appartient aux Noirs                ║
-║  🌍 Serveur démarré sur le port ${PORT}                    ║
-║  📍 Environnement: ${NODE_ENV}                                   ║
-║                                                        ║
-║  Documentation: https://les-noires.africa              ║
+║  API REST : http://localhost:${API_PORT}                ║
+║  Mesh Socket : ws://localhost:${MESH_PORT}             ║
+║  🌍 Environnement: ${NODE_ENV}                           ║
 ╚════════════════════════════════════════════════════════╝
   `);
 });
 
-module.exports = app;
+meshServer.listen(MESH_PORT, () => {
+  console.log(`Mesh relay listening on port ${MESH_PORT}`);
+});
+
+module.exports = { app, apiServer, meshServer, users, meshNodes, meshPeers };
